@@ -64,13 +64,13 @@ cargo run -p oxide-cli -- stream-info --name email
 Install Oxide on a Linux server as a systemd service:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oxide-queue/oxide/main/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/mrfelipemartins/oxide/main/scripts/install.sh | sudo bash
 ```
 
 Install a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oxide-queue/oxide/main/scripts/install.sh \
+curl -fsSL https://raw.githubusercontent.com/mrfelipemartins/oxide/main/scripts/install.sh \
   | sudo OXIDE_VERSION=v0.1.0 bash
 ```
 

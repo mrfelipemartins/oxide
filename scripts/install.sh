@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="${OXIDE_REPO:-oxide-queue/oxide}"
+REPO="${OXIDE_REPO:-mrfelipemartins/oxide}"
 VERSION="${OXIDE_VERSION:-latest}"
 ARCH="${OXIDE_ARCH:-$(uname -m)}"
 OS="$(uname -s)"
@@ -27,10 +27,10 @@ usage() {
 Install Oxide and register it as a systemd service.
 
 Usage:
-  curl -fsSL https://raw.githubusercontent.com/oxide-queue/oxide/main/scripts/install.sh | sudo bash
+  curl -fsSL https://raw.githubusercontent.com/mrfelipemartins/oxide/main/scripts/install.sh | sudo bash
 
 Environment:
-  OXIDE_REPO=owner/repo             GitHub repository. Default: oxide-queue/oxide
+  OXIDE_REPO=owner/repo             GitHub repository. Default: mrfelipemartins/oxide
   OXIDE_VERSION=latest             Release version or "latest". Default: latest
   OXIDE_ARCH=x86_64                Release architecture. Default: uname -m
   OXIDE_PREFIX=/usr/local          Install prefix. Default: /usr/local

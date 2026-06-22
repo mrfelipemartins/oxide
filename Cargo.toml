@@ -11,7 +11,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/oxide-queue/oxide"
+repository = "https://github.com/mrfelipemartins/oxide"
 rust-version = "1.85"
 version = "0.1.0"
 
