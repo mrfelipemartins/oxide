@@ -1,0 +1,44 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editors and local IDE state
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*.swo
+*~
+
+# Rust build output
+/target/
+
+# Oxide local runtime data
+/oxide-data/
+/data/
+/tmp/
+*.wal
+*.snap
+*.log
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+
+# Coverage, profiling, and benchmark artifacts
+/coverage/
+/htmlcov/
+/dist/
+*.profraw
+*.profdata
+criterion/
+target/criterion/
+
+# Archives and release artifacts
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.dmg

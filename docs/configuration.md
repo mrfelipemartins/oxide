@@ -1,0 +1,34 @@
+# Configuration
+
+Oxide config is TOML with environment overrides.
+
+```toml
+listen_addr = "127.0.0.1:7379"
+data_dir = "./oxide-data"
+max_frame_bytes = 67108864
+default_claim_wait_ms = 30000
+graceful_shutdown_ms = 5000
+# auth_token = "change-me"
+log_level = "info"
+
+[wal]
+segment_bytes = 134217728
+fsync_mode = "batch"
+batch_bytes = 4194304
+batch_interval_ms = 10
+
+[stream_defaults]
+partitions = 1
+policy = "priority"
+max_payload_bytes = 1048576
+default_ttr_ms = 30000
+dedupe_ttl_ms = 86400000
+```
+
+Environment overrides:
+
+- `OXIDE_LISTEN_ADDR`
+- `OXIDE_DATA_DIR`
+- `OXIDE_LOG_LEVEL`
+- `OXIDE_AUTH_TOKEN`
+- `OXIDE_WAL_FSYNC_MODE`: `always`, `batch`, or `async`

@@ -1,0 +1,43 @@
+[workspace]
+members = [
+    "crates/oxide-cli",
+    "crates/oxide-core",
+    "crates/oxide-server",
+    "crates/oxide-wal",
+    "crates/oxide-wire",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/oxide-queue/oxide"
+rust-version = "1.85"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+bytes = { version = "1.10", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+crc32fast = "1.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+humantime-serde = "1.1"
+parking_lot = "0.12"
+proptest = "1.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.15"
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+
+[profile.bench]
+debug = true

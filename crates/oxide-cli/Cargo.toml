@@ -1,0 +1,24 @@
+[package]
+name = "oxide-cli"
+description = "Command-line interface for Oxide."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "oxide"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+oxide-core = { path = "../oxide-core" }
+oxide-server = { path = "../oxide-server" }
+oxide-wal = { path = "../oxide-wal" }
+oxide-wire = { path = "../oxide-wire" }
+serde_json.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
