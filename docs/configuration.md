@@ -7,6 +7,7 @@ listen_addr = "127.0.0.1:7379"
 data_dir = "./oxide-data"
 max_frame_bytes = 67108864
 default_claim_wait_ms = 30000
+lazy_claim_stream_creation = true
 graceful_shutdown_ms = 5000
 # auth_token = "change-me"
 log_level = "info"
@@ -31,4 +32,5 @@ Environment overrides:
 - `OXIDE_DATA_DIR`
 - `OXIDE_LOG_LEVEL`
 - `OXIDE_AUTH_TOKEN`
+- `OXIDE_LAZY_CLAIM_STREAM_CREATION`: `true` or `false`
 - `OXIDE_WAL_FSYNC_MODE`: `always`, `batch`, or `async`

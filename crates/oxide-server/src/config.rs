@@ -26,6 +26,7 @@ pub struct OxideConfig {
     pub data_dir: PathBuf,
     pub max_frame_bytes: usize,
     pub default_claim_wait_ms: u64,
+    pub lazy_claim_stream_creation: bool,
     pub graceful_shutdown_ms: u64,
     pub auth_token: Option<String>,
     pub log_level: String,
@@ -59,6 +60,7 @@ impl Default for OxideConfig {
             data_dir: PathBuf::from("./oxide-data"),
             max_frame_bytes: 64 * 1024 * 1024,
             default_claim_wait_ms: 30_000,
+            lazy_claim_stream_creation: true,
             graceful_shutdown_ms: 5_000,
             auth_token: None,
             log_level: "info".to_owned(),
@@ -179,12 +181,58 @@ impl OxideConfig {
         if let Ok(value) = env::var("OXIDE_AUTH_TOKEN") {
             self.auth_token = Some(value);
         }
+        if let Ok(value) = env::var("OXIDE_LAZY_CLAIM_STREAM_CREATION") {
+            self.lazy_claim_stream_creation = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
         if let Ok(value) = env::var("OXIDE_WAL_FSYNC_MODE") {
             self.wal.fsync_mode = match value.as_str() {
                 "always" => FsyncMode::Always,
                 "async" => FsyncMode::Async,
                 _ => FsyncMode::Batch,
             };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn lazy_claim_stream_creation_defaults_to_enabled() {
+        assert!(OxideConfig::default().lazy_claim_stream_creation);
+    }
+
+    #[test]
+    fn lazy_claim_stream_creation_can_be_disabled_by_env() {
+        let _guard = env_lock().lock().unwrap();
+        let previous = env::var("OXIDE_LAZY_CLAIM_STREAM_CREATION").ok();
+        unsafe {
+            env::set_var("OXIDE_LAZY_CLAIM_STREAM_CREATION", "false");
+        }
+
+        let config = OxideConfig::load(None::<&std::path::Path>).unwrap();
+
+        restore_env("OXIDE_LAZY_CLAIM_STREAM_CREATION", previous);
+        assert!(!config.lazy_claim_stream_creation);
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn restore_env(key: &str, value: Option<String>) {
+        unsafe {
+            match value {
+                Some(value) => env::set_var(key, value),
+                None => env::remove_var(key),
+            }
         }
     }
 }

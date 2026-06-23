@@ -45,6 +45,10 @@ All integer fields are big-endian.
 - `RESUME`: requires `stream` header
 - `DRAIN`: flushes WAL and returns stats
 
+`WORK.CLAIM` and `WORK.CLAIM_MANY` lazily create missing streams from server
+`stream_defaults` when `lazy_claim_stream_creation` is enabled. Other stream
+and work operations still return an error for missing streams.
+
 ## Response Headers
 
 Responses include a `status` header:

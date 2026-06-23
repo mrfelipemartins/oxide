@@ -102,19 +102,17 @@ impl Engine {
     }
 
     pub fn create_stream(&mut self, config: StreamConfig) -> EngineResult<EngineEvent> {
+        let event = self.prepare_create_stream(config)?;
+        self.apply_event(event.clone())?;
+
+        Ok(event)
+    }
+
+    pub fn prepare_create_stream(&self, config: StreamConfig) -> EngineResult<EngineEvent> {
         validate_stream_config(&config)?;
         if self.streams.contains_key(&config.name) {
             return Err(EngineError::StreamAlreadyExists(config.name));
         }
-        self.streams.insert(
-            config.name.clone(),
-            StreamRuntime {
-                config: config.clone(),
-                ready: BTreeSet::new(),
-                scheduled: BTreeSet::new(),
-                paused_until_ms: None,
-            },
-        );
         Ok(EngineEvent::StreamCreated(config))
     }
 
@@ -140,6 +138,21 @@ impl Engine {
             .values()
             .map(|runtime| runtime.config.clone())
             .collect()
+    }
+
+    fn insert_stream(&mut self, config: StreamConfig) -> EngineResult<()> {
+        validate_stream_config(&config)?;
+        self.streams.insert(
+            config.name.clone(),
+            StreamRuntime {
+                config,
+                ready: BTreeSet::new(),
+                scheduled: BTreeSet::new(),
+                paused_until_ms: None,
+            },
+        );
+
+        Ok(())
     }
 
     pub fn prepare_submit(&self, mut submit: SubmitWork) -> EngineResult<(EngineEvent, WorkId)> {
@@ -207,21 +220,7 @@ impl Engine {
         &mut self,
         request: ClaimManyRequest,
     ) -> EngineResult<(EngineEvent, Vec<ClaimedWork>)> {
-        if request.max == 0 {
-            return Err(EngineError::InvalidArgument(
-                "claim max must be greater than zero".to_owned(),
-            ));
-        }
-        if request.streams.is_empty() {
-            return Err(EngineError::InvalidArgument(
-                "at least one stream is required".to_owned(),
-            ));
-        }
-        if request.lease_ms == 0 {
-            return Err(EngineError::InvalidArgument(
-                "lease must be greater than zero".to_owned(),
-            ));
-        }
+        Self::validate_claim_request_shape(&request)?;
         self.promote_due(now_ms());
         self.requeue_expired(now_ms());
 
@@ -287,21 +286,7 @@ impl Engine {
         request: ClaimManyRequest,
         now: TimestampMs,
     ) -> EngineResult<(EngineEvent, Vec<ClaimedWork>)> {
-        if request.max == 0 {
-            return Err(EngineError::InvalidArgument(
-                "claim max must be greater than zero".to_owned(),
-            ));
-        }
-        if request.streams.is_empty() {
-            return Err(EngineError::InvalidArgument(
-                "at least one stream is required".to_owned(),
-            ));
-        }
-        if request.lease_ms == 0 {
-            return Err(EngineError::InvalidArgument(
-                "lease must be greater than zero".to_owned(),
-            ));
-        }
+        Self::validate_claim_request_shape(&request)?;
 
         for stream in &request.streams {
             if !self.streams.contains_key(stream) {
@@ -352,6 +337,26 @@ impl Engine {
         }
 
         Ok((EngineEvent::WorkClaimed(claim_records), claimed))
+    }
+
+    pub fn validate_claim_request_shape(request: &ClaimManyRequest) -> EngineResult<()> {
+        if request.max == 0 {
+            return Err(EngineError::InvalidArgument(
+                "claim max must be greater than zero".to_owned(),
+            ));
+        }
+        if request.streams.is_empty() {
+            return Err(EngineError::InvalidArgument(
+                "at least one stream is required".to_owned(),
+            ));
+        }
+        if request.lease_ms == 0 {
+            return Err(EngineError::InvalidArgument(
+                "lease must be greater than zero".to_owned(),
+            ));
+        }
+
+        Ok(())
     }
 
     pub fn ack(&mut self, request: CompleteRequest) -> EngineResult<EngineEvent> {
@@ -725,7 +730,7 @@ impl Engine {
         match event {
             EngineEvent::StreamCreated(config) => {
                 if !self.streams.contains_key(&config.name) {
-                    self.create_stream(config)?;
+                    self.insert_stream(config)?;
                 }
             }
             EngineEvent::StreamUpdated(config) => {
@@ -1098,6 +1103,18 @@ mod tests {
             .create_stream(StreamConfig::new("email"))
             .expect("stream is created");
         engine
+    }
+
+    #[test]
+    fn prepare_create_stream_does_not_mutate_engine() {
+        let mut engine = Engine::new();
+        let event = engine
+            .prepare_create_stream(StreamConfig::new("transcribe"))
+            .unwrap();
+
+        assert_eq!(engine.stats().streams, 0);
+        engine.apply_event(event).unwrap();
+        assert_eq!(engine.stats().streams, 1);
     }
 
     #[test]

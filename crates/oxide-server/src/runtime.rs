@@ -601,6 +601,23 @@ impl OxideRuntime {
                 let now = now_ms();
                 engine.promote_due(now);
                 engine.requeue_expired(now);
+                Engine::validate_claim_request_shape(&request)?;
+
+                if self.config.lazy_claim_stream_creation {
+                    let mut wal = self.wal.lock().await;
+                    for stream in &request.streams {
+                        if matches!(
+                            engine.stream_config(stream),
+                            Err(EngineError::StreamNotFound(_))
+                        ) {
+                            let event = engine
+                                .prepare_create_stream(self.config.default_stream_config(stream))?;
+                            wal.append(&event)?;
+                            engine.apply_event(event)?;
+                        }
+                    }
+                }
+
                 let (event, claimed) = engine.prepare_claim_many(request.clone(), now)?;
 
                 if !claimed.is_empty() {
@@ -696,7 +713,7 @@ fn clear_stream_response(result: ClearStreamResult) -> ClearStreamResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxide_core::{ClaimRequest, StreamConfig, SubmitWork};
+    use oxide_core::{ClaimManyRequest, ClaimRequest, StreamConfig, SubmitWork};
     use oxide_wire::encode;
     use tempfile::tempdir;
 
@@ -751,6 +768,174 @@ mod tests {
             )
             .await;
         assert_eq!(response.headers.get("status").unwrap(), "empty");
+    }
+
+    #[tokio::test]
+    async fn claim_lazily_creates_missing_stream() {
+        let dir = tempdir().unwrap();
+        let runtime = OxideRuntime::open(OxideConfig {
+            data_dir: dir.path().to_path_buf(),
+            default_claim_wait_ms: 1,
+            ..OxideConfig::default()
+        })
+        .unwrap();
+        let claim = ClaimRequest::one("transcribe", "workers", "worker-1");
+
+        let response = runtime
+            .handle_frame(
+                Frame::new("WORK.CLAIM")
+                    .with_header("wait_ms", "1")
+                    .with_payload(serde_json::to_vec(&claim).unwrap()),
+            )
+            .await;
+
+        assert_eq!(response.headers.get("status").unwrap(), "empty");
+        let info = runtime
+            .handle_frame(Frame::new("STREAM.INFO").with_header("stream", "transcribe"))
+            .await;
+        assert_eq!(info.headers.get("status").unwrap(), "ok");
+        let stats: serde_json::Value = serde_json::from_slice(&info.payload).unwrap();
+        assert_eq!(stats["name"].as_str(), Some("transcribe"));
+    }
+
+    #[tokio::test]
+    async fn lazy_claim_stream_is_recovered_from_wal() {
+        let dir = tempdir().unwrap();
+        let config = OxideConfig {
+            data_dir: dir.path().to_path_buf(),
+            default_claim_wait_ms: 1,
+            ..OxideConfig::default()
+        };
+        let runtime = OxideRuntime::open(config.clone()).unwrap();
+        let claim = ClaimRequest::one("transcribe", "workers", "worker-1");
+        let response = runtime
+            .handle_frame(
+                Frame::new("WORK.CLAIM")
+                    .with_header("wait_ms", "1")
+                    .with_payload(serde_json::to_vec(&claim).unwrap()),
+            )
+            .await;
+        assert_eq!(response.headers.get("status").unwrap(), "empty");
+        runtime.flush().await.unwrap();
+        drop(runtime);
+
+        let recovered = OxideRuntime::open(config).unwrap();
+        let info = recovered
+            .handle_frame(Frame::new("STREAM.INFO").with_header("stream", "transcribe"))
+            .await;
+        assert_eq!(info.headers.get("status").unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn claim_many_lazily_creates_missing_streams() {
+        let dir = tempdir().unwrap();
+        let runtime = OxideRuntime::open(OxideConfig {
+            data_dir: dir.path().to_path_buf(),
+            default_claim_wait_ms: 1,
+            ..OxideConfig::default()
+        })
+        .unwrap();
+        let claim = ClaimManyRequest {
+            streams: vec!["high".to_owned(), "default".to_owned(), "low".to_owned()],
+            consumer_group: "workers".to_owned(),
+            worker_id: "worker-1".to_owned(),
+            max: 1,
+            lease_ms: 30_000,
+        };
+
+        let response = runtime
+            .handle_frame(
+                Frame::new("WORK.CLAIM_MANY")
+                    .with_header("wait_ms", "1")
+                    .with_payload(serde_json::to_vec(&claim).unwrap()),
+            )
+            .await;
+
+        assert_eq!(response.headers.get("status").unwrap(), "empty");
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.engine.streams, 3);
+        for stream in ["high", "default", "low"] {
+            let info = runtime
+                .handle_frame(Frame::new("STREAM.INFO").with_header("stream", stream))
+                .await;
+            assert_eq!(info.headers.get("status").unwrap(), "ok");
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_missing_stream_errors_when_lazy_creation_is_disabled() {
+        let dir = tempdir().unwrap();
+        let runtime = OxideRuntime::open(OxideConfig {
+            data_dir: dir.path().to_path_buf(),
+            default_claim_wait_ms: 1,
+            lazy_claim_stream_creation: false,
+            ..OxideConfig::default()
+        })
+        .unwrap();
+        let claim = ClaimRequest::one("transcribe", "workers", "worker-1");
+
+        let response = runtime
+            .handle_frame(
+                Frame::new("WORK.CLAIM")
+                    .with_header("wait_ms", "1")
+                    .with_payload(serde_json::to_vec(&claim).unwrap()),
+            )
+            .await;
+
+        assert_eq!(response.headers.get("status").unwrap(), "error");
+        assert_eq!(
+            response.headers.get("error").map(String::as_str),
+            Some("stream does not exist: transcribe"),
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_claim_does_not_create_stream() {
+        let dir = tempdir().unwrap();
+        let runtime = OxideRuntime::open(OxideConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..OxideConfig::default()
+        })
+        .unwrap();
+        let claim = ClaimManyRequest {
+            streams: vec!["transcribe".to_owned()],
+            consumer_group: "workers".to_owned(),
+            worker_id: "worker-1".to_owned(),
+            max: 0,
+            lease_ms: 30_000,
+        };
+
+        let response = runtime
+            .handle_frame(
+                Frame::new("WORK.CLAIM_MANY").with_payload(serde_json::to_vec(&claim).unwrap()),
+            )
+            .await;
+
+        assert_eq!(response.headers.get("status").unwrap(), "error");
+        assert_eq!(runtime.metrics().await.engine.streams, 0);
+    }
+
+    #[tokio::test]
+    async fn submit_missing_stream_stays_strict() {
+        let dir = tempdir().unwrap();
+        let runtime = OxideRuntime::open(OxideConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..OxideConfig::default()
+        })
+        .unwrap();
+        let submit = SubmitWork::new("transcribe", b"hello".to_vec());
+
+        let response = runtime
+            .handle_frame(
+                Frame::new("WORK.SUBMIT").with_payload(serde_json::to_vec(&submit).unwrap()),
+            )
+            .await;
+
+        assert_eq!(response.headers.get("status").unwrap(), "error");
+        assert_eq!(
+            response.headers.get("error").map(String::as_str),
+            Some("stream does not exist: transcribe"),
+        );
     }
 
     #[tokio::test]
