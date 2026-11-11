@@ -145,11 +145,19 @@ struct PauseRequest {
 impl OxideRuntime {
     pub fn open(config: OxideConfig) -> RuntimeResult<Self> {
         std::fs::create_dir_all(&config.data_dir)?;
+        // Open before replaying: opening truncates a torn trailing record, so
+        // replay and later appends both see the same clean log.
+        let wal = Wal::open(config.wal_config())?;
+        if wal.truncated_tail_bytes() > 0 {
+            tracing::warn!(
+                bytes = wal.truncated_tail_bytes(),
+                "truncated torn record at the end of the WAL (unclean shutdown)"
+            );
+        }
         let mut engine = Engine::new();
         for event in Wal::replay(config.wal_dir())? {
             engine.apply_event(event)?;
         }
-        let wal = Wal::open(config.wal_config())?;
         Ok(Self {
             config,
             engine: Arc::new(Mutex::new(engine)),

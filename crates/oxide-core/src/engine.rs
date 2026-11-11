@@ -767,6 +767,17 @@ impl Engine {
                     self.next_fence_token = self
                         .next_fence_token
                         .max(claim.fence_token.saturating_add(1));
+                    // Lease expiry is not logged. A new claim for the same work
+                    // means the earlier lease expired, so drop it here or a
+                    // replayed engine keeps a stale claim that later "expires"
+                    // and redelivers work that is still leased.
+                    if let Some(old_claim_id) = self.work_claims.remove(&claim.work_id) {
+                        if let Some(old) = self.claims.remove(&old_claim_id) {
+                            if let Some(lane) = old.lane_key {
+                                self.active_lanes.remove(&(old.stream, lane));
+                            }
+                        }
+                    }
                     if let Some(work) = self.work.get_mut(&claim.work_id) {
                         if let Some(stream) = self.streams.get_mut(&work.stream) {
                             stream.ready.remove(&QueueEntry::from_work(work));
@@ -1313,6 +1324,43 @@ mod tests {
         assert!(result.work_ids.contains(&ready_id));
         assert_eq!(engine.stats().cancelled, 3);
         assert_eq!(engine.stats().live_claims, 0);
+    }
+
+    #[test]
+    fn replay_drops_claim_superseded_after_lease_expiry() {
+        let mut live = Engine::new();
+        let mut events = vec![live.create_stream(StreamConfig::new("email")).unwrap()];
+        let mut submit = SubmitWork::new("email", b"body".to_vec());
+        submit.lane_key = Some("account-1".to_owned());
+        events.push(live.submit(submit).unwrap().0);
+        let mut short = ClaimRequest::one("email", "workers", "worker-1");
+        short.lease_ms = 1;
+        events.push(live.claim(short).unwrap().0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let (event, claimed) = live
+            .claim(ClaimRequest::one("email", "workers", "worker-2"))
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        events.push(event);
+
+        let mut replayed = Engine::new();
+        for event in events {
+            replayed.apply_event(event).unwrap();
+        }
+
+        assert_eq!(replayed.stats().live_claims, 1);
+        let (_, stolen) = replayed
+            .claim(ClaimRequest::one("email", "workers", "worker-3"))
+            .unwrap();
+        assert!(stolen.is_empty(), "work leased to worker-2 was redelivered");
+        let claim = &claimed[0].claim;
+        replayed
+            .ack(CompleteRequest {
+                claim_id: claim.claim_id,
+                work_id: claim.work_id,
+                fence_token: claim.fence_token,
+            })
+            .unwrap();
     }
 
     #[test]

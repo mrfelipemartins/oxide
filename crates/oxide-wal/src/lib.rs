@@ -2,7 +2,7 @@ use crc32fast::Hasher;
 use oxide_core::EngineEvent;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -75,13 +75,21 @@ pub struct Wal {
     active_len: u64,
     unsynced_bytes: u64,
     last_sync: Instant,
+    truncated_tail_bytes: u64,
 }
 
 impl Wal {
+    /// Opens the WAL for appending.
+    ///
+    /// If the active segment ends in a torn record (a crash mid-write), the
+    /// partial bytes are truncated so new records are not appended after
+    /// garbage. If valid records follow the bad bytes, this is real
+    /// corruption rather than a torn write and an error is returned instead.
     pub fn open(config: WalConfig) -> WalResult<Self> {
         fs::create_dir_all(&config.dir)?;
         let active_index = latest_segment_index(&config.dir)?.unwrap_or(0);
         let active_path = segment_path(&config.dir, active_index);
+        let truncated_tail_bytes = repair_torn_tail(&active_path)?;
         let active = OpenOptions::new()
             .create(true)
             .append(true)
@@ -96,7 +104,13 @@ impl Wal {
             active_len,
             unsynced_bytes: 0,
             last_sync: Instant::now(),
+            truncated_tail_bytes,
         })
+    }
+
+    /// Bytes of a torn trailing record removed by [`Wal::open`], if any.
+    pub fn truncated_tail_bytes(&self) -> u64 {
+        self.truncated_tail_bytes
     }
 
     pub fn append(&mut self, event: &EngineEvent) -> WalResult<()> {
@@ -125,21 +139,30 @@ impl Wal {
         Ok(())
     }
 
+    /// Replays every record in segment order.
+    ///
+    /// A torn trailing record is tolerated only in the last segment; sealed
+    /// segments must be complete.
     pub fn replay(dir: impl AsRef<Path>) -> WalResult<Vec<EngineEvent>> {
+        let segments = list_segments(dir.as_ref())?;
+        let last = segments.len().saturating_sub(1);
         let mut events = Vec::new();
-        for segment in list_segments(dir.as_ref())? {
-            let mut file = File::open(&segment.path)?;
-            let mut offset = 0_u64;
-            loop {
-                match read_record(&mut file, &segment.path, offset) {
-                    Ok(Some((event, bytes_read))) => {
-                        offset = offset.saturating_add(bytes_read);
-                        events.push(event);
-                    }
-                    Ok(None) => break,
-                    Err(WalError::Io(err)) if err.kind() == ErrorKind::UnexpectedEof => break,
-                    Err(err) => return Err(err),
-                }
+        for (position, segment) in segments.iter().enumerate() {
+            let bytes = fs::read(&segment.path)?;
+            let valid = valid_prefix_len(&bytes, &segment.path)?;
+            if valid < bytes.len() && position != last {
+                return Err(WalError::Corrupt {
+                    path: segment.path.clone(),
+                    offset: valid as u64,
+                    reason: "incomplete record in a sealed segment".to_owned(),
+                });
+            }
+            let mut offset = 0;
+            while offset < valid {
+                let len = record_payload_len(&bytes[offset..]);
+                let start = offset + HEADER_LEN;
+                events.push(serde_json::from_slice(&bytes[start..start + len])?);
+                offset = start + len;
             }
         }
         Ok(events)
@@ -195,45 +218,87 @@ fn encode_record(event: &EngineEvent) -> WalResult<Vec<u8>> {
     Ok(record)
 }
 
-fn read_record(file: &mut File, path: &Path, offset: u64) -> WalResult<Option<(EngineEvent, u64)>> {
-    file.seek(SeekFrom::Start(offset))?;
-    let mut header = [0_u8; HEADER_LEN];
-    let mut read = 0_usize;
-    while read < HEADER_LEN {
-        let n = file.read(&mut header[read..])?;
-        if n == 0 {
-            if read == 0 {
-                return Ok(None);
-            }
-            return Ok(None);
-        }
-        read += n;
-    }
+enum RecordCheck {
+    /// A complete record with a matching checksum, of this total length.
+    Valid(usize),
+    /// Not a valid record; the reason is used in error messages.
+    Invalid(&'static str),
+}
 
-    if &header[0..4] != WAL_MAGIC {
-        return Err(WalError::Corrupt {
-            path: path.to_path_buf(),
-            offset,
-            reason: "invalid magic".to_owned(),
-        });
-    }
-    let len = u32::from_le_bytes(header[4..8].try_into().expect("header slice"));
-    let expected_crc = u32::from_le_bytes(header[8..12].try_into().expect("header slice"));
-    let mut payload = vec![0_u8; len as usize];
-    file.read_exact(&mut payload)?;
+fn record_payload_len(buf: &[u8]) -> usize {
+    u32::from_le_bytes(buf[4..8].try_into().expect("header slice")) as usize
+}
 
+fn check_record(buf: &[u8]) -> RecordCheck {
+    if buf.len() < HEADER_LEN {
+        return RecordCheck::Invalid("incomplete header");
+    }
+    if &buf[0..4] != WAL_MAGIC {
+        return RecordCheck::Invalid("invalid magic");
+    }
+    let len = record_payload_len(buf);
+    let Some(total) = HEADER_LEN.checked_add(len).filter(|total| *total <= buf.len()) else {
+        return RecordCheck::Invalid("incomplete payload");
+    };
+    let expected_crc = u32::from_le_bytes(buf[8..12].try_into().expect("header slice"));
     let mut hasher = Hasher::new();
-    hasher.update(&payload);
-    let actual_crc = hasher.finalize();
-    if expected_crc != actual_crc {
-        return Err(WalError::Corrupt {
-            path: path.to_path_buf(),
-            offset,
-            reason: "checksum mismatch".to_owned(),
-        });
+    hasher.update(&buf[HEADER_LEN..total]);
+    if hasher.finalize() != expected_crc {
+        return RecordCheck::Invalid("checksum mismatch");
     }
-    let event = serde_json::from_slice(&payload)?;
-    Ok(Some((event, HEADER_LEN as u64 + u64::from(len))))
+    RecordCheck::Valid(total)
+}
+
+/// Returns the length of the longest prefix made of valid records.
+///
+/// Bytes after that prefix are treated as a torn write only when no valid
+/// record can be found anywhere after them. Otherwise the damage is in the
+/// middle of the log and truncating would drop durable records, so this
+/// returns [`WalError::Corrupt`].
+fn valid_prefix_len(bytes: &[u8], path: &Path) -> WalResult<usize> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match check_record(&bytes[offset..]) {
+            RecordCheck::Valid(len) => offset += len,
+            RecordCheck::Invalid(reason) => {
+                if let Some(next) = find_valid_record(bytes, offset + 1) {
+                    return Err(WalError::Corrupt {
+                        path: path.to_path_buf(),
+                        offset: offset as u64,
+                        reason: format!(
+                            "{reason}; a valid record follows at offset {next}, refusing to truncate"
+                        ),
+                    });
+                }
+                return Ok(offset);
+            }
+        }
+    }
+    Ok(offset)
+}
+
+fn find_valid_record(bytes: &[u8], from: usize) -> Option<usize> {
+    (from..bytes.len().saturating_sub(HEADER_LEN - 1)).find(|&position| {
+        bytes[position..].starts_with(WAL_MAGIC)
+            && matches!(check_record(&bytes[position..]), RecordCheck::Valid(_))
+    })
+}
+
+/// Truncates a torn trailing record from `path`, returning the bytes removed.
+fn repair_torn_tail(path: &Path) -> WalResult<u64> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err.into()),
+    };
+    let valid = valid_prefix_len(&bytes, path)?;
+    if valid == bytes.len() {
+        return Ok(0);
+    }
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(valid as u64)?;
+    file.sync_all()?;
+    Ok((bytes.len() - valid) as u64)
 }
 
 fn list_segments(dir: &Path) -> WalResult<Vec<WalSegmentInfo>> {
@@ -275,7 +340,99 @@ fn parse_segment_index(path: &Path) -> Option<u64> {
 mod tests {
     use super::*;
     use oxide_core::{Engine, StreamConfig, SubmitWork};
+    use std::io::{Seek, SeekFrom};
     use tempfile::tempdir;
+
+    fn always(dir: &Path) -> WalConfig {
+        WalConfig {
+            fsync_mode: FsyncMode::Always,
+            ..WalConfig::new(dir)
+        }
+    }
+
+    fn write_events(wal: &mut Wal, engine: &mut Engine, payloads: &[&str]) {
+        for payload in payloads {
+            let (event, _) = engine
+                .submit(SubmitWork::new("email", payload.as_bytes().to_vec()))
+                .unwrap();
+            wal.append(&event).unwrap();
+        }
+    }
+
+    fn engine_with_stream(wal: &mut Wal) -> Engine {
+        let mut engine = Engine::new();
+        let event = engine.create_stream(StreamConfig::new("email")).unwrap();
+        wal.append(&event).unwrap();
+        engine
+    }
+
+    fn truncate_by(path: &Path, bytes: u64) {
+        let len = fs::metadata(path).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(len - bytes)
+            .unwrap();
+    }
+
+    #[test]
+    fn torn_tail_is_truncated_and_later_appends_replay() {
+        let dir = tempdir().unwrap();
+        let mut wal = Wal::open(always(dir.path())).unwrap();
+        let mut engine = engine_with_stream(&mut wal);
+        write_events(&mut wal, &mut engine, &["one"]);
+        drop(wal);
+        let path = Wal::inspect(dir.path()).unwrap()[0].path.clone();
+        truncate_by(&path, 7);
+
+        let mut wal = Wal::open(always(dir.path())).unwrap();
+        assert!(wal.truncated_tail_bytes() > 0);
+        write_events(&mut wal, &mut engine, &["two", "three"]);
+        drop(wal);
+
+        assert_eq!(Wal::replay(dir.path()).unwrap().len(), 3);
+        let reopened = Wal::open(always(dir.path())).unwrap();
+        assert_eq!(reopened.truncated_tail_bytes(), 0);
+    }
+
+    #[test]
+    fn torn_header_is_truncated() {
+        let dir = tempdir().unwrap();
+        let mut wal = Wal::open(always(dir.path())).unwrap();
+        let mut engine = engine_with_stream(&mut wal);
+        drop(wal);
+        let path = Wal::inspect(dir.path()).unwrap()[0].path.clone();
+        let clean_len = fs::metadata(&path).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&WAL_MAGIC[..3]).unwrap();
+        drop(file);
+
+        let mut wal = Wal::open(always(dir.path())).unwrap();
+        assert_eq!(wal.truncated_tail_bytes(), 3);
+        assert_eq!(fs::metadata(&path).unwrap().len(), clean_len);
+        write_events(&mut wal, &mut engine, &["after"]);
+        assert_eq!(Wal::replay(dir.path()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn incomplete_sealed_segment_is_reported() {
+        let dir = tempdir().unwrap();
+        let mut wal = Wal::open(WalConfig {
+            segment_bytes: 64,
+            ..always(dir.path())
+        })
+        .unwrap();
+        let mut engine = engine_with_stream(&mut wal);
+        write_events(&mut wal, &mut engine, &["one", "two"]);
+        drop(wal);
+        let segments = Wal::inspect(dir.path()).unwrap();
+        assert!(segments.len() >= 2);
+        truncate_by(&segments[0].path, 5);
+
+        let err = Wal::replay(dir.path()).unwrap_err();
+        assert!(matches!(err, WalError::Corrupt { .. }));
+    }
 
     #[test]
     fn appends_and_replays_events() {
@@ -324,26 +481,23 @@ mod tests {
     }
 
     #[test]
-    fn detects_checksum_corruption() {
+    fn corruption_before_valid_records_is_reported_not_truncated() {
         let dir = tempdir().unwrap();
-        let mut wal = Wal::open(WalConfig {
-            dir: dir.path().to_path_buf(),
-            fsync_mode: FsyncMode::Always,
-            ..WalConfig::new(dir.path())
-        })
-        .unwrap();
-
-        let mut engine = Engine::new();
-        let event = engine.create_stream(StreamConfig::new("email")).unwrap();
-        wal.append(&event).unwrap();
-        wal.flush().unwrap();
+        let mut wal = Wal::open(always(dir.path())).unwrap();
+        let mut engine = engine_with_stream(&mut wal);
+        write_events(&mut wal, &mut engine, &["after"]);
+        drop(wal);
         let path = Wal::inspect(dir.path()).unwrap()[0].path.clone();
-        let mut file = OpenOptions::new().write(true).open(path).unwrap();
+        let len_before = fs::metadata(&path).unwrap().len();
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
         file.seek(SeekFrom::Start((HEADER_LEN + 3) as u64)).unwrap();
         file.write_all(b"x").unwrap();
         file.sync_all().unwrap();
 
         let err = Wal::replay(dir.path()).unwrap_err();
         assert!(matches!(err, WalError::Corrupt { .. }));
+        let err = Wal::open(always(dir.path())).unwrap_err();
+        assert!(matches!(err, WalError::Corrupt { .. }));
+        assert_eq!(fs::metadata(&path).unwrap().len(), len_before);
     }
 }
